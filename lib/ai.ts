@@ -2,8 +2,8 @@ import { z } from "zod";
 import type { BrandRule } from "./schema";
 import type { AiCandidate } from "./review";
 
-export const aiEnabled = () => !!process.env.ANTHROPIC_API_KEY;
-
+const useGroq = () => process.env.LLM_PROVIDER === "groq" && !!process.env.GROQ_API_KEY;
+export const aiEnabled = () => useGroq() || !!process.env.ANTHROPIC_API_KEY;
 const Out = z.object({
   findings: z
     .array(
@@ -43,38 +43,58 @@ export async function analyzeWithClaude(
   text: string,
   ctx: { guide: string; rules: BrandRule[]; claims: { text: string }[] },
 ): Promise<AiResult> {
-  const key = process.env.ANTHROPIC_API_KEY;
+  const groq = useGroq();
+  const key = groq ? process.env.GROQ_API_KEY : process.env.ANTHROPIC_API_KEY;
   if (!key) return { ok: false, status: "skipped", error: "Claude analysis is off: ANTHROPIC_API_KEY is not set." };
+  const label = groq ? "Groq" : "Claude";
+  const userContent = JSON.stringify({
+    guide: ctx.guide,
+    rules: ctx.rules.map((r) => ({ id: r.id, kind: r.kind, pattern: r.pattern, replacement: r.replacement, rationale: r.rationale })),
+    approvedClaims: ctx.claims.map((c) => c.text),
+    content: text,
+  });
   try {
-    const res = await fetch(`${process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com"}/v1/messages`, {
-      method: "POST",
-      headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-      body: JSON.stringify({
-        model: process.env.ANTHROPIC_MODEL || "claude-sonnet-5-5",
-        max_tokens: 1500,
-        system: SYSTEM,
-        messages: [
-          {
-            role: "user",
-            content: JSON.stringify({
-              guide: ctx.guide,
-              rules: ctx.rules.map((r) => ({ id: r.id, kind: r.kind, pattern: r.pattern, replacement: r.replacement, rationale: r.rationale })),
-              approvedClaims: ctx.claims.map((c) => c.text),
-              content: text,
-            }),
-          },
-        ],
-      }),
-      signal: AbortSignal.timeout(25000),
-    });
-    if (!res.ok) throw new Error(`Claude API returned HTTP ${res.status}`);
-    const data = await res.json();
-    const raw = ((data.content ?? []) as { type: string; text?: string }[])
-      .filter((b) => b.type === "text")
-      .map((b) => b.text ?? "")
-      .join("");
+    let raw: string;
+    if (groq) {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+          temperature: 0,
+          max_tokens: 1500,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: SYSTEM },
+            { role: "user", content: userContent },
+          ],
+        }),
+        signal: AbortSignal.timeout(25000),
+      });
+      if (!res.ok) throw new Error(`${label} API returned HTTP ${res.status}`);
+      const data = await res.json();
+      raw = data.choices?.[0]?.message?.content ?? "";
+    } else {
+      const res = await fetch(`${process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com"}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: process.env.ANTHROPIC_MODEL || "claude-sonnet-5-5",
+          max_tokens: 1500,
+          system: SYSTEM,
+          messages: [{ role: "user", content: userContent }],
+        }),
+        signal: AbortSignal.timeout(25000),
+      });
+      if (!res.ok) throw new Error(`${label} API returned HTTP ${res.status}`);
+      const data = await res.json();
+      raw = ((data.content ?? []) as { type: string; text?: string }[])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text ?? "")
+        .join("");
+    }
     return { ok: true, candidates: parseAiJson(raw) };
   } catch (e) {
-    return { ok: false, status: "failed", error: `Claude analysis failed: ${(e as Error).message}` };
+    return { ok: false, status: "failed", error: `${label} analysis failed: ${(e as Error).message}` };
   }
 }
